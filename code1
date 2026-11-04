@@ -1,0 +1,160 @@
+import os
+import matplotlib.pyplot as plt
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+from tensorflow.keras.callbacks import Callback, EarlyStopping
+
+BASE_DIR = "datasets/intel-image-classification"
+IMG_SIZE = (96, 96)
+BATCH_SIZE = 32
+EPOCHS = 15
+SEED = 42
+
+train_ds = keras.utils.image_dataset_from_directory(
+    os.path.join(BASE_DIR, "seg_train"),
+    labels="inferred", label_mode="int",
+    image_size=IMG_SIZE, batch_size=BATCH_SIZE,
+    shuffle=True, seed=SEED,
+)
+
+val_ds = keras.utils.image_dataset_from_directory(
+    os.path.join(BASE_DIR, "seg_val"),
+    labels="inferred", label_mode="int",
+    image_size=IMG_SIZE, batch_size=BATCH_SIZE,
+    shuffle=False,
+)
+
+class_names = train_ds.class_names
+print("Классы:", class_names)
+
+normalization_layer = layers.Rescaling(1.0 / 255)
+train_ds = train_ds.map(lambda x, y: (normalization_layer(x), y))
+val_ds = val_ds.map(lambda x, y: (normalization_layer(x), y))
+
+AUTOTUNE = tf.data.AUTOTUNE
+train_ds = train_ds.cache().prefetch(buffer_size=AUTOTUNE)
+val_ds = val_ds.cache().prefetch(buffer_size=AUTOTUNE)
+
+model = keras.Sequential([
+    layers.Input(shape=(*IMG_SIZE, 3)),
+    layers.Conv2D(32, (3, 3), activation="relu"),
+    layers.MaxPooling2D(),
+    layers.Conv2D(64, (3, 3), activation="relu"),
+    layers.MaxPooling2D(),
+    layers.Conv2D(128, (3, 3), activation="relu"),
+    layers.MaxPooling2D(),
+    layers.Flatten(),
+    layers.Dense(128, activation="relu"),
+    layers.Dropout(0.5),
+    layers.Dense(len(class_names), activation="softmax"),
+])
+
+model.summary()
+
+model.compile(
+    optimizer="adam",
+    loss="sparse_categorical_crossentropy",
+    metrics=["accuracy"],
+)
+
+class LivePlotCallback(Callback):
+    def __init__(self):
+        super().__init__()
+        self.train_acc, self.val_acc = [], []
+        self.train_loss, self.val_loss = [], []
+        plt.ion()
+        self.fig, (self.ax1, self.ax2) = plt.subplots(1, 2, figsize=(12, 4))
+        self.fig.suptitle("Обучение (обновляется в реальном времени)")
+
+    def on_epoch_end(self, epoch, logs=None):
+        logs = logs or {}
+        acc_key = "accuracy" if "accuracy" in logs else "sparse_categorical_accuracy"
+        val_acc_key = "val_" + acc_key
+
+        self.train_acc.append(logs.get(acc_key, 0))
+        self.val_acc.append(logs.get(val_acc_key, 0))
+        self.train_loss.append(logs.get("loss", 0))
+        self.val_loss.append(logs.get("val_loss", 0))
+
+        epochs = range(1, len(self.train_acc) + 1)
+
+        self.ax1.clear()
+        self.ax1.plot(epochs, self.train_acc, "b-", label="Train")
+        self.ax1.plot(epochs, self.val_acc, "r-", label="Val")
+        self.ax1.set_title("Точность")
+        self.ax1.set_xlabel("Эпоха")
+        self.ax1.set_ylabel("Accuracy")
+        self.ax1.legend()
+        self.ax1.grid(True)
+
+        self.ax2.clear()
+        self.ax2.plot(epochs, self.train_loss, "b-", label="Train")
+        self.ax2.plot(epochs, self.val_loss, "r-", label="Val")
+        self.ax2.set_title("Потери")
+        self.ax2.set_xlabel("Эпоха")
+        self.ax2.set_ylabel("Loss")
+        self.ax2.legend()
+        self.ax2.grid(True)
+
+        self.fig.tight_layout()
+        plt.pause(0.1)
+
+    def on_train_end(self, logs=None):
+        plt.ioff()
+
+live_cb = LivePlotCallback()
+
+early_stop = EarlyStopping(
+    monitor="val_loss", patience=3,
+    restore_best_weights=True, verbose=1,
+)
+
+history = model.fit(
+    train_ds,
+    validation_data=val_ds,
+    epochs=EPOCHS,
+    callbacks=[live_cb, early_stop],
+)
+
+def plot_predictions(dataset, model, class_names, num_images=9):
+    for images, labels in dataset.take(1):
+        predictions = model.predict(images, verbose=0)
+        predicted_classes = tf.argmax(predictions, axis=1)
+
+        plt.figure(figsize=(10, 10))
+        for i in range(min(num_images, len(images))):
+            ax = plt.subplot(3, 3, i + 1)
+            plt.imshow(images[i].numpy())
+            true_label = class_names[labels[i]]
+            pred_label = class_names[predicted_classes[i]]
+            color = "green" if true_label == pred_label else "red"
+            plt.title(f"Истина: {true_label}\nПрогноз: {pred_label}", color=color)
+            plt.axis("off")
+        plt.tight_layout()
+        plt.show()
+
+plt.figure(figsize=(12, 4))
+
+plt.subplot(1, 2, 1)
+plt.plot(live_cb.train_acc, label="Train")
+plt.plot(live_cb.val_acc, label="Val")
+plt.title("Точность (итог)")
+plt.xlabel("Эпоха")
+plt.ylabel("Accuracy")
+plt.legend()
+plt.grid(True)
+
+plt.subplot(1, 2, 2)
+plt.plot(live_cb.train_loss, label="Train")
+plt.plot(live_cb.val_loss, label="Val")
+plt.title("Потери (итог)")
+plt.xlabel("Эпоха")
+plt.ylabel("Loss")
+plt.legend()
+plt.grid(True)
+
+plt.tight_layout()
+plt.show()
+
+plot_predictions(val_ds, model, class_names)
