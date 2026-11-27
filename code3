@@ -1,0 +1,132 @@
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+
+BASE_DIR = "datasets/intel-image-classification"
+IMG_SIZE = (96, 96)
+BATCH_SIZE = 32
+SEED = 42
+EMBED_DIM = 256
+LSTM_UNITS = 256
+VOCAB_SIZE = 1000
+MAX_LENGTH = 12
+EPOCHS = 10
+
+train_ds = keras.utils.image_dataset_from_directory(
+    os.path.join(BASE_DIR, "seg_train"),
+    labels="inferred", label_mode="int",
+    image_size=IMG_SIZE, batch_size=BATCH_SIZE,
+    shuffle=True, seed=SEED,
+)
+
+class_names = train_ds.class_names
+
+captions = [f"startseq на изображении {name} endseq" for name in class_names]
+
+# векторизатор
+vectorizer = layers.TextVectorization(
+    max_tokens=VOCAB_SIZE,
+    output_sequence_length=MAX_LENGTH,
+    standardize=None
+)
+vectorizer.adapt(tf.constant(captions))
+
+# ветка изображения
+image_input = keras.Input(shape=(*IMG_SIZE, 3), name="image_input")
+x = tf.keras.applications.mobilenet_v2.preprocess_input(image_input)
+
+base_model = tf.keras.applications.MobileNetV2(
+    input_shape=(*IMG_SIZE, 3),
+    include_top=False,
+    weights='imagenet'
+)
+base_model.trainable = False  # чтобы не обучать заново
+
+x = base_model(x, training=False)
+x = layers.GlobalAveragePooling2D()(x)
+image_features = layers.Dense(EMBED_DIM, activation="relu")(x)
+
+# ветка текста
+text_input = keras.Input(shape=(MAX_LENGTH,), name="text_input")
+y = layers.Embedding(VOCAB_SIZE, EMBED_DIM, mask_zero=True)(text_input)
+y = layers.LSTM(LSTM_UNITS)(y)
+
+# объединение
+combined = layers.concatenate([image_features, y])
+z = layers.Dense(LSTM_UNITS, activation="relu")(combined)
+output = layers.Dense(VOCAB_SIZE, activation="softmax")(z)
+
+model = keras.Model(inputs=[image_input, text_input], outputs=output)
+model.compile(loss="sparse_categorical_crossentropy", optimizer="adam")
+
+
+# генератор данных
+def train_generator(dataset):
+    while True:
+        for images, labels in dataset:
+            for i in range(len(images)):
+                img = images[i:i + 1]
+                label = int(labels[i])
+                caption = captions[label]
+                seq = vectorizer(tf.constant([caption]))[0].numpy()
+                actual_len = np.sum(seq != 0)
+
+                for j in range(1, actual_len):
+                    in_seq = np.zeros((1, MAX_LENGTH))
+                    in_seq[0, :j] = seq[:j]
+                    out_word = np.array([[seq[j]]])
+                    yield (img, in_seq), out_word
+
+
+# Берем 300 батчей и учим 10 эпох
+train_subset = train_ds.take(300)
+steps_per_epoch = 300 * BATCH_SIZE
+
+model.fit(train_generator(train_subset), steps_per_epoch=steps_per_epoch, epochs=EPOCHS)
+
+
+# генерация текста
+def generate_caption(image, temperature=0.5):
+    in_text = "startseq"
+    for i in range(MAX_LENGTH):
+        seq = vectorizer(tf.constant([in_text]))[0].numpy()
+        seq = np.expand_dims(seq, axis=0)
+        yhat = model.predict([image[np.newaxis, ...], seq], verbose=0)[0]
+
+        yhat = np.log(yhat + 1e-8) / temperature
+        yhat = np.exp(yhat) / np.sum(np.exp(yhat))
+
+        idx = np.random.choice(len(yhat), p=yhat)
+        word = vectorizer.get_vocabulary()[idx]
+
+        if word == "" or word == "[UNK]":
+            continue
+        if word == "endseq":
+            break
+        in_text += " " + word
+    return in_text.replace("startseq ", "")
+
+
+# визуализация
+def visualize_results(dataset, num_images=9):
+    plt.figure(figsize=(12, 12))
+    for images, labels in dataset.skip(2).take(1):
+        for i in range(min(num_images, len(images))):
+            img = images[i]
+            true_label = class_names[int(labels[i])]
+            pred_text = generate_caption(img)
+
+            ax = plt.subplot(3, 3, i + 1)
+            plt.imshow(img.numpy().astype("uint8"))
+
+            color = "green" if true_label in pred_text else "red"
+            plt.title(f"Истина: {true_label}\nТекст: {pred_text}", color=color)
+            plt.axis("off")
+    plt.tight_layout()
+    plt.show()
+
+
+visualize_results(train_ds)
