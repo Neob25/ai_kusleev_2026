@@ -1,0 +1,282 @@
+#download_dataset
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+from torchvision.datasets import OxfordIIITPet
+
+dataset = OxfordIIITPet(
+    root=str(Path("data")),
+    split="trainval",
+    target_types="segmentation",
+    download=True,
+)
+
+print(f"Загружено изображений: {len(dataset)}")
+
+image, mask = dataset[0]
+mask_array = np.array(mask)
+
+print(f"Размер изображения: {image.size}")
+print(f"Размер маски: {mask.size}")
+print(f"Значения в маске: {np.unique(mask_array)}")
+
+fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+
+axes[0].imshow(image)
+axes[0].set_title("Исходное изображение")
+axes[0].axis("off")
+
+axes[1].imshow(mask_array, cmap="viridis", vmin=1, vmax=3)
+axes[1].set_title("Маска сегментации")
+axes[1].axis("off")
+
+plt.tight_layout()
+plt.show()
+
+
+
+  from pathlib import Path
+
+#train_segmentation
+import numpy as np
+import torch
+import torch.nn as nn
+from PIL import Image
+from torch.utils.data import Dataset, DataLoader, random_split
+from torchvision.datasets import OxfordIIITPet
+from torchvision.transforms.functional import to_tensor
+import matplotlib.pyplot as plt
+
+ROOT = Path(__file__).resolve().parent
+DATA_DIR = ROOT / "data"
+MODEL_PATH = ROOT / "pet_unet.pth"
+
+IMAGE_SIZE = 128
+BATCH_SIZE = 16
+EPOCHS = 5
+NUM_CLASSES = 3
+
+
+class PetSegmentationDataset(Dataset):
+
+    def __init__(self, dataset):
+        self.dataset = dataset
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, index):
+        image, mask = self.dataset[index]
+
+        image = image.convert("RGB").resize(
+            (IMAGE_SIZE, IMAGE_SIZE),
+            Image.Resampling.BILINEAR,
+        )
+        mask = mask.resize(
+            (IMAGE_SIZE, IMAGE_SIZE),
+            Image.Resampling.NEAREST,
+        )
+
+        image_tensor = to_tensor(image)
+
+        mask_array = np.array(mask, dtype=np.uint8).copy()
+        mask_tensor = torch.from_numpy(mask_array).long() - 1
+
+        return image_tensor, mask_tensor
+
+
+class DoubleConv(nn.Module):
+
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x):
+        return self.layers(x)
+
+
+class UNet(nn.Module):
+    def __init__(self, num_classes=3):
+        super().__init__()
+        self.pool = nn.MaxPool2d(kernel_size=2)
+
+        self.enc1 = DoubleConv(3, 16)
+        self.enc2 = DoubleConv(16, 32)
+        self.enc3 = DoubleConv(32, 64)
+        self.enc4 = DoubleConv(64, 128)
+        self.bottleneck = DoubleConv(128, 256)
+
+        self.up4 = nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2)
+        self.dec4 = DoubleConv(256, 128)
+
+        self.up3 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
+        self.dec3 = DoubleConv(128, 64)
+
+        self.up2 = nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2)
+        self.dec2 = DoubleConv(64, 32)
+
+        self.up1 = nn.ConvTranspose2d(32, 16, kernel_size=2, stride=2)
+        self.dec1 = DoubleConv(32, 16)
+
+        self.output = nn.Conv2d(16, num_classes, kernel_size=1)
+
+    def forward(self, x):
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool(e1))
+        e3 = self.enc3(self.pool(e2))
+        e4 = self.enc4(self.pool(e3))
+
+        center = self.bottleneck(self.pool(e4))
+
+        d4 = self.dec4(torch.cat([self.up4(center), e4], dim=1))
+        d3 = self.dec3(torch.cat([self.up3(d4), e3], dim=1))
+        d2 = self.dec2(torch.cat([self.up2(d3), e2], dim=1))
+        d1 = self.dec1(torch.cat([self.up1(d2), e1], dim=1))
+
+        return self.output(d1)
+
+
+def evaluate(model, loader, loss_function, device):
+    model.eval()
+    total_loss = 0.0
+    confusion = torch.zeros(
+        (NUM_CLASSES, NUM_CLASSES),
+        dtype=torch.int64,
+        device=device,
+    )
+
+    with torch.no_grad():
+        for images, masks in loader:
+            images = images.to(device)
+            masks = masks.to(device)
+
+            outputs = model(images)
+            loss = loss_function(outputs, masks)
+            total_loss += loss.item() * images.size(0)
+
+            predictions = outputs.argmax(dim=1)
+            indices = NUM_CLASSES * masks.reshape(-1) + predictions.reshape(-1)
+            confusion += torch.bincount(
+                indices,
+                minlength=NUM_CLASSES * NUM_CLASSES,
+            ).reshape(NUM_CLASSES, NUM_CLASSES)
+
+    average_loss = total_loss / len(loader.dataset)
+
+    intersection = confusion.diag()
+    union = confusion.sum(dim=0) + confusion.sum(dim=1) - intersection
+    pet_iou = (intersection[0].float() / union[0].clamp(min=1)).item()
+
+    return average_loss, pet_iou
+
+
+def main():
+    torch.manual_seed(42)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Устройство: {device}")
+
+    original_dataset = OxfordIIITPet(
+        root=str(DATA_DIR),
+        split="trainval",
+        target_types="segmentation",
+        download=False,
+    )
+    dataset = PetSegmentationDataset(original_dataset)
+
+    train_size = int(0.8 * len(dataset))
+    val_size = len(dataset) - train_size
+    train_dataset, val_dataset = random_split(
+        dataset,
+        [train_size, val_size],
+        generator=torch.Generator().manual_seed(42),
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=0,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=0,
+    )
+
+    model = UNet(num_classes=NUM_CLASSES).to(device)
+    loss_function = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+    for epoch in range(EPOCHS):
+        model.train()
+        total_train_loss = 0.0
+
+        for images, masks in train_loader:
+            images = images.to(device)
+            masks = masks.to(device)
+
+            optimizer.zero_grad()
+            outputs = model(images)
+            loss = loss_function(outputs, masks)
+            loss.backward()
+            optimizer.step()
+
+            total_train_loss += loss.item() * images.size(0)
+
+        train_loss = total_train_loss / len(train_dataset)
+        val_loss, pet_iou = evaluate(
+            model,
+            val_loader,
+            loss_function,
+            device,
+        )
+
+        print(
+            f"Эпоха {epoch + 1}/{EPOCHS} | "
+            f"train loss: {train_loss:.4f} | "
+            f"val loss: {val_loss:.4f} | "
+            f"IoU питомца: {pet_iou:.4f}"
+        )
+
+    torch.save(model.state_dict(), MODEL_PATH)
+    print(f"Модель сохранена: {MODEL_PATH}")
+
+    model.eval()
+    images, masks = next(iter(val_loader))
+
+    with torch.no_grad():
+        predictions = model(images.to(device)).argmax(dim=1).cpu()
+
+    image = images[0].permute(1, 2, 0).numpy()
+    true_mask = masks[0].numpy()
+    predicted_mask = predictions[0].numpy()
+
+    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+    axes[0].imshow(image)
+    axes[0].set_title("Изображение")
+
+    axes[1].imshow(true_mask, vmin=0, vmax=2, cmap="viridis")
+    axes[1].set_title("Правильная маска")
+
+    axes[2].imshow(predicted_mask, vmin=0, vmax=2, cmap="viridis")
+    axes[2].set_title("Предсказание U-Net")
+
+    for ax in axes:
+        ax.axis("off")
+
+    plt.tight_layout()
+    plt.show()
+
+
+if __name__ == "__main__":
+    main()
